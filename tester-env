@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# tester-env CLI for the rybbit fork deployment overlay (fork root).
+#
+# Image policy: IMAGE_TAG is exported by scripts/rl-env as a
+# content-addressed tag so identical (baseline, patch-set) combos share an
+# image. Manual invocations default to tester-env-rybbit:dev. RUN_ID scopes
+# ONLY containers/volumes (compose project name), never the image name.
+#
+# Usage: ./tester-env {deploy|seed|verify|reset|stop|status|logs|help}
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_BASE="${SCRIPT_DIR}/docker-compose.yml"
+COMPOSE_OVERLAY="${SCRIPT_DIR}/docker-compose.tester-env.yml"
+
+# IMAGE_TAG is one tag shared by every service built from this source tree
+# (single backend/client source build). rl-env sets it; manual runs get :dev.
+IMAGE_TAG="${IMAGE_TAG:-tester-env-rybbit:dev}"
+export IMAGE_TAG
+
+# Host ports. Fixed defaults match the evidence-backed prospect deployment;
+# override via env when parallel runs need distinct ports.
+# Backend :3001 (API, incl. auth + track), client :3002 (dashboard), proxy :8080.
+BACKEND_PORT="${BACKEND_PORT:-3001}"
+CLIENT_PORT="${CLIENT_PORT:-3002}"
+PROXY_PORT="${PROXY_PORT:-8080}"
+export BACKEND_PORT CLIENT_PORT PROXY_PORT
+
+SUFFIX="${RUN_ID:+-${RUN_ID}}"
+PROJECT="tester-env-rybbit${SUFFIX}"
+
+SEED_EMAIL="${SEED_EMAIL:-tester@example.com}"
+SEED_PASSWORD="${SEED_PASSWORD:-TestPass123!}"
+SEED_ORG_NAME="${SEED_ORG_NAME:-Test Org}"
+SEED_ORG_SLUG="${SEED_ORG_SLUG:-test-org}"
+SEED_SITE_1_DOMAIN="${SEED_SITE_1_DOMAIN:-example.com}"
+SEED_SITE_2_DOMAIN="${SEED_SITE_2_DOMAIN:-second.com}"
+
+log() { echo "==> $*"; }
+
+dc() {
+  docker compose -f "${COMPOSE_BASE}" -f "${COMPOSE_OVERLAY}" -p "${PROJECT}" "$@"
+}
+
+backend_url() { echo "http://localhost:${BACKEND_PORT}"; }
+client_url() { echo "http://localhost:${CLIENT_PORT}"; }
+
+wait_backend() {
+  log "Waiting for backend API at $(backend_url)/api/health ..."
+  local i
+  for i in $(seq 1 60); do
+    if curl -sf -m 5 "$(backend_url)/api/health" >/dev/null 2>&1 \
+      || curl -sf -m 5 "$(backend_url)/api/auth/get-session" >/dev/null 2>&1; then
+      log "Backend is ready."
+      return 0
+    fi
+    sleep 5
+  done
+  echo "ERROR: backend did not become ready within ~300s" >&2
+  return 1
+}
+
+wait_services() {
+  log "Waiting for postgres/clickhouse/redis to report healthy ..."
+  local i
+  for i in $(seq 1 30); do
+    if dc ps --format '{{.Service}} {{.Health}}' 2>/dev/null | grep -qvE 'healthy|running' >/dev/null 2>&1; then
+      sleep 5
+    else
+      return 0
+    fi
+  done
+  return 0
+}
+
+cmd_deploy() {
+  log "Building images (${IMAGE_TAG}) and starting stack for project '${PROJECT}'"
+  log "Deploying from source: server/Dockerfile + client/Dockerfile"
+  dc build
+  dc up -d
+  wait_services || true
+  wait_backend
+  log "Deployment complete."
+  log "Backend API: $(backend_url)"
+  log "Client UI:   $(client_url)"
+  log "Proxy (same-origin): http://localhost:${PROXY_PORT}"
+  log "First run needs browser signup: ${SEED_EMAIL} / [SEED_PASSWORD], org '${SEED_ORG_NAME}', site '${SEED_SITE_1_DOMAIN}'."
+  log "Then run: ./tester-env seed && ./tester-env verify"
+}
+
+cmd_seed() {
+  log "Seeding deterministic Rybbit analytics via public /api/track ($(backend_url))"
+  log "Prerequisite: first-user signup done in browser (${SEED_EMAIL}, org '${SEED_ORG_NAME}', site '${SEED_SITE_1_DOMAIN}')"
+  BASE_URL="$(backend_url)" SITE_ID=1 python3 "${SCRIPT_DIR}/tester-env-seed/seed.py" \
+    --base-url "$(backend_url)" --site-id 1
+  log "Seed complete."
+}
+
+cmd_verify() {
+  log "Verifying deterministic Rybbit seed data ($(backend_url), site 1)"
+  BASE_URL="$(backend_url)" python3 "${SCRIPT_DIR}/tester-env-seed/verify.py" \
+    --base-url "$(backend_url)" --site-id 1 \
+    --email "${SEED_EMAIL}" --password "${SEED_PASSWORD}"
+  log "Verify complete."
+}
+
+cmd_reset() {
+  log "Removing containers and volumes for project '${PROJECT}' only (images kept)"
+  dc down -v --remove-orphans 2>/dev/null || true
+  log "Clean slate. Run './tester-env deploy' to start fresh (then browser signup + seed)."
+}
+
+cmd_stop() {
+  log "Stopping containers for project '${PROJECT}' (volumes preserved)"
+  dc stop 2>/dev/null || true
+  log "Stopped."
+}
+
+cmd_status() {
+  log "Rybbit Tester Environment Status (project '${PROJECT}')"
+  local running
+  running=$(dc ps 2>/dev/null || true)
+  if [[ -z "$running" ]]; then
+    echo "Status: NOT RUNNING"
+  else
+    echo "$running"
+    echo ""
+    echo "URLs:"
+    echo "  Backend API: $(backend_url)"
+    echo "  Client UI:   $(client_url)"
+    echo "  Proxy:       http://localhost:${PROXY_PORT}"
+    echo "Seed login: ${SEED_EMAIL} / [SEED_PASSWORD]"
+  fi
+}
+
+cmd_logs() {
+  dc logs --tail=200 "$@"
+}
+
+cmd_help() {
+  cat <<EOF
+Rybbit - Tester Environment CLI
+
+Usage: $0 COMMAND
+
+Commands:
+  deploy   Build backend+client images from source, start the stack, wait healthy.
+  seed     Load deterministic seed dataset via /api/track (clears first; idempotent).
+  verify   Assert expected seed counts/states via API (exit non-zero on mismatch).
+  reset    Stop and remove this project's containers AND volumes (clean slate).
+  stop     Stop containers without deleting volumes/data.
+  status   Show container state and URLs.
+  logs     Print recent logs (optionally: $0 logs <service>).
+  help     Show this message.
+
+Env vars:
+  IMAGE_TAG    Shared image name/tag for source builds (default tester-env-rybbit:dev; set by scripts/rl-env)
+  RUN_ID       Optional run id; scopes container/volume names only (never images).
+  BACKEND_PORT Host port for the backend API (default 3001).
+  CLIENT_PORT  Host port for the dashboard client (default 3002).
+  PROXY_PORT   Host port for the same-origin Caddy proxy (default 8080).
+
+Credentials (deterministic): ${SEED_EMAIL} / [SEED_PASSWORD]
+Org: ${SEED_ORG_NAME} (${SEED_ORG_SLUG}); Sites: ${SEED_SITE_1_DOMAIN} (seeded), ${SEED_SITE_2_DOMAIN} (empty edge case)
+EOF
+}
+
+case "${1:-help}" in
+  deploy) cmd_deploy ;;
+  seed) cmd_seed ;;
+  verify) cmd_verify ;;
+  reset) cmd_reset ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  logs) shift 2>/dev/null || true; cmd_logs "$@" ;;
+  help|--help|-h|*) cmd_help ;;
+esac

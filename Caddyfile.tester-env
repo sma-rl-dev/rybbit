@@ -1,0 +1,31 @@
+# Same-origin reverse proxy for the tester-env deployment (fork root).
+# Why: the Rybbit client calls the backend cross-origin (NEXT_PUBLIC_BACKEND_URL
+# is baked at build time). Any origin other than the page origin is rejected by
+# the backend: trusted CORS origins = {BASE_URL origin} + TRUSTED_ORIGINS
+# (server/src/lib/cors.ts getTrustedCorsOrigins), plus an onRequest hook that
+# returns 403 "Origin not allowed" for untrusted POST/PUT/PATCH/DELETE.
+# A same-origin proxy on :8080 makes page origin == API origin, so no CORS
+# preflight and no origin rejection: /api/* -> backend:3001, everything else
+# -> client:3002.
+:8080 {
+  bind 0.0.0.0
+  encode zstd gzip
+
+  request_body max_size 10MB
+
+  handle /api/* {
+    reverse_proxy backend:3001
+  }
+
+  handle /.well-known/oauth-* {
+    reverse_proxy backend:3001
+  }
+
+  handle /.well-known/openid-configuration* {
+    reverse_proxy backend:3001
+  }
+
+  handle {
+    reverse_proxy client:3002
+  }
+}
