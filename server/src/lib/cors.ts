@@ -73,6 +73,17 @@ export function getTrustedCorsOrigins(env: NodeJS.ProcessEnv = process.env): str
     origins.add(baseUrlOrigin);
   }
 
+  // Tester-env: extra trusted browser origins (comma-separated), e.g. the
+  // host bridge gateway URL the containerized browser uses to reach the app.
+  // Upstream only trusts BASE_URL in production, which breaks any deployment
+  // where the browser origin differs from the backend URL.
+  for (const entry of (env.TRUSTED_ORIGINS ?? "").split(",")) {
+    const origin = normalizeCorsOrigin(entry);
+    if (origin) {
+      origins.add(origin);
+    }
+  }
+
   if (env.NODE_ENV !== "production") {
     for (const origin of devTrustedOrigins) {
       origins.add(origin);
