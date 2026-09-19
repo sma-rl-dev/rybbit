@@ -68,11 +68,14 @@ def main():
     out = {}
 
     out["events"] = ch(f"SELECT count() FROM analytics.events WHERE site_id = {sid}")
+    out["pageviews"] = ch(f"SELECT count() FROM analytics.events WHERE site_id = {sid} AND type = 'pageview'")
     out["sessions"] = ch(f"SELECT uniq(session_id) FROM analytics.events WHERE site_id = {sid}")
     out["users"] = ch(f"SELECT uniq(user_id) FROM analytics.events WHERE site_id = {sid}")
     out["bot_events"] = ch(f"SELECT count() FROM analytics.bot_events WHERE site_id = {sid}")
-    out["by_page"] = ch(f"SELECT pathname, count() FROM analytics.events WHERE site_id = {sid} GROUP BY pathname ORDER BY pathname FORMAT TabSeparated")
+    out["by_page"] = ch(f"SELECT pathname, count() FROM analytics.events WHERE site_id = {sid} AND type = 'pageview' GROUP BY pathname ORDER BY pathname FORMAT TabSeparated")
     out["channels"] = ch(f"SELECT channel, count() FROM analytics.events WHERE site_id = {sid} GROUP BY channel ORDER BY channel FORMAT TabSeparated")
+    out["special_event_rows"] = ch(f"SELECT count() FROM analytics.events WHERE site_id = {sid} AND type = 'custom_event' AND event_name = 'Signup $& Bonus'")
+    out["special_event_names"] = ch(f"SELECT DISTINCT event_name FROM analytics.events WHERE site_id = {sid} AND type = 'custom_event' FORMAT TabSeparated")
 
     cookie = sign_in(args.base_url, args.email, args.password)
     out["signed_in"] = bool(cookie)
@@ -85,9 +88,11 @@ def main():
 
     checks = [
         ("events non-zero", out["events"] not in ("0", "")),
+        ("pageviews == 184", out["pageviews"] == "184"),
         ("sessions non-zero", out["sessions"] not in ("0", "")),
         ("users non-zero", out["users"] not in ("0", "")),
         ("no bot leakage", out["bot_events"] == "0"),
+        ("special-char custom event present", out["special_event_rows"] not in ("0", "")),
         ("has-data true", out["has_data"]["status"] == 200 and body_true(out["has_data"]["body"])),
         ("overview pageviews > 0", overview_pageviews(out["overview"]) > 0),
     ]

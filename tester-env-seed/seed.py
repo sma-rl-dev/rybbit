@@ -16,6 +16,11 @@ produces byte-identical event plans. Across calendar days, timestamps shift
 (relative-to-now) but counts and visible dashboard structure stay identical;
 scenario assertions should use counts/totals/trends, not absolute dates.
 
+Plus one fixed custom event "Signup $& Bonus" (type custom_event, visitor
+seed-alice-001, /pricing) for the special-character Events-table scenario.
+It is a non-pageview type, so overview pageviews stay 184 and sessions/users
+stay 8/8; total rows become 185.
+
 Requires browser-like headers (Accept, Accept-Language, sec-fetch-site) so the
 server-side bot heuristics accept the events as genuine pageviews.
 """
@@ -71,6 +76,12 @@ REFERRERS = {
     "github": "https://github.com/",
 }
 
+# Fixed custom event for the special-character display-name scenario. Sent as a
+# non-pageview type so overview pageview/sessions/users counts stay identical.
+SPECIAL_EVENT_NAME = "Signup $& Bonus"
+SPECIAL_EVENT_VISITOR = 0  # seed-alice-001: joins her existing session/user
+SPECIAL_EVENT_PATH = "/pricing"
+
 
 def post(base, path, payload, headers=None, ua=None, timeout=20):
     h = dict(BROWSER_HEADERS)
@@ -107,6 +118,29 @@ def track(base, site_id, visitor, page, title, day_offset, seq, now, extra=None,
     }
     if extra and extra.get("querystring"):
         payload["querystring"] = extra["querystring"]
+    st, body = post(base, "/api/track", payload, ua=ua)
+    if verbose and st != 200:
+        print("TRACK FAIL", st, body, file=sys.stderr)
+    return st == 200
+
+
+def track_custom_event(base, site_id, visitor, verbose=False):
+    """Post the fixed special-character custom event for the Events table."""
+    anon, ua, lang, (sw, sh) = visitor[:4]
+    payload = {
+        "type": "custom_event",
+        "site_id": str(site_id),
+        "hostname": "example.com" if site_id == 1 else "second.com",
+        "pathname": SPECIAL_EVENT_PATH,
+        "page_title": "Acme Store — Pricing",
+        "language": lang,
+        "screenWidth": sw,
+        "screenHeight": sh,
+        "anonymous_id": anon,
+        "referrer": "",
+        "event_name": SPECIAL_EVENT_NAME,
+        "properties": json.dumps({"plan": "bonus"}),
+    }
     st, body = post(base, "/api/track", payload, ua=ua)
     if verbose and st != 200:
         print("TRACK FAIL", st, body, file=sys.stderr)
@@ -195,20 +229,33 @@ def main():
         # pace well under it. Real visits are also spread across days.
         time.sleep(1.2)
 
+    # 1b. One fixed custom event (non-pageview type: overview pageview counts
+    # stay 184). Reuses visitor 0's identity so it joins her existing session
+    # and user (sessions/users stay 8/8) and shows in the Events table.
+    time.sleep(1.2)
+    special_ok = track_custom_event(args.base_url, args.site_id,
+                                    VISITORS[SPECIAL_EVENT_VISITOR], args.verbose)
+
     # 1. Wait for async queue flush (1s interval) then verify.
     time.sleep(6)
     events = ch_exec(f"SELECT count() FROM analytics.events WHERE site_id = {args.site_id}")
     sessions = ch_exec(f"SELECT uniq(session_id) FROM analytics.events WHERE site_id = {args.site_id}")
     users = ch_exec(f"SELECT uniq(user_id) FROM analytics.events WHERE site_id = {args.site_id}")
-    by_page = ch_exec(f"SELECT pathname, count() FROM analytics.events WHERE site_id = {args.site_id} GROUP BY pathname ORDER BY pathname FORMAT TabSeparated")
+    by_page = ch_exec(f"SELECT pathname, count() FROM analytics.events WHERE site_id = {args.site_id} AND type = 'pageview' GROUP BY pathname ORDER BY pathname FORMAT TabSeparated")
+    pageviews = ch_exec(f"SELECT count() FROM analytics.events WHERE site_id = {args.site_id} AND type = 'pageview'")
+    special = ch_exec(f"SELECT count() FROM analytics.events WHERE site_id = {args.site_id} AND type = 'custom_event' AND event_name = '{SPECIAL_EVENT_NAME}'")
     print(json.dumps({
         "site_id": args.site_id,
         "planned": len(plan),
         "accepted": ok,
         "events": events,
+        "pageviews": pageviews,
         "sessions": sessions,
         "users": users,
         "by_page": by_page,
+        "special_event": SPECIAL_EVENT_NAME,
+        "special_event_accepted": special_ok,
+        "special_event_rows": special,
         "cleared_before": before,
     }, indent=2))
 
