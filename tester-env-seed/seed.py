@@ -2,13 +2,14 @@
 """Rybbit deterministic seed: realistic analytics via /api/track + one goal + one funnel.
 
 Usage:
-  python3 seed.py [--base-url http://172.17.0.1:3001] [--site-id 1] [--days 14]
+  python3 seed.py [--base-url http://localhost:8080] [--site-id 1] [--days 14] [--bootstrap]
 
 Idempotent at the analytics level: clears analytics.events + bot_events for the
 target site(s) first, then replays a fixed synthetic traffic plan derived from a
 fixed visitor roster (no randomness). Relational seed (user/org/sites) is left
-untouched when present; --bootstrap can recreate the smoke-test baseline on a
-fresh DB via the public signup API.
+untouched when present; --bootstrap recreates the smoke-test baseline on a
+fresh DB via the public signup API (first user -> admin, Test Org, example.com
++ second.com), reusing anything that already exists.
 
 Determinism: fixed visitor roster x fixed per-day page sequences x fixed
 timestamps relative to seed day (UTC). Re-running on the same calendar day
@@ -26,7 +27,11 @@ server-side bot heuristics accept the events as genuine pageviews.
 """
 import argparse
 import hashlib
+import http.cookiejar
 import json
+import os
+import shlex
+import subprocess
 import sys
 import time
 import urllib.request
@@ -187,24 +192,94 @@ def build_plan(days):
     return plan
 
 
-def ch_exec(sql, ch_host="127.0.0.1", ch_port=8123, user="default", password="frog"):
-    import base64
-    # Lightweight mutations (ALTER DELETE) must go through POST body; long
-    # quoted GET URLs 500 on this ClickHouse build.
-    data = sql.encode()
-    req = urllib.request.Request(f"http://{ch_host}:{ch_port}/", data=data, headers={
-        "Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode().strip()
+def ch_exec(sql):
+    # ClickHouse publishes no host port; run scoped queries in its container.
+    # RYBBIT_CH_QUERY is exported by the tester-env CLI (compose project run).
+    argv = shlex.split(os.environ["RYBBIT_CH_QUERY"]) + [sql]
+    out = subprocess.run(argv, capture_output=True, text=True, timeout=60, check=True)
+    return out.stdout.strip()
+
+
+def api(base, opener, method, path, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method, headers={
+        "Content-Type": "application/json", "Accept": "application/json",
+        # Normal browser header: our own configured base origin. The backend
+        # (better-auth) rejects origin-less auth POSTs with
+        # MISSING_OR_NULL_ORIGIN; this value is exactly the origin the CLI
+        # pointed us at, never a foreign origin. No trust expansion.
+        "Origin": base})
+    try:
+        with opener.open(req, timeout=20) as r:
+            return r.status, _read_json(r)
+    except urllib.error.HTTPError as e:
+        return e.code, _read_json(e)
+
+
+def _read_json(r):
+    try:
+        return json.loads(r.read().decode() or "null")
+    except Exception:
+        return None
+
+
+def bootstrap(base):
+    """Create the manifest relational baseline; reuse a complete one as-is.
+
+    Mirrors browser signup: step 1 creates the account (the first user becomes
+    admin via the backend hook), step 2 creates the org then the sites
+    (client/src/app/signup/page.tsx). Manifest pins: tester@example.com /
+    Test Org (test-org) owning example.com (seeded) and second.com (empty).
+    A signed-in run already has its baseline, so only a fresh DB signs up.
+    Anything in between fails loudly; recovery is the ordinary reset path.
+    """
+    email = os.environ.get("SEED_EMAIL", "tester@example.com")
+    password = os.environ.get("SEED_PASSWORD", "TestPass123!")
+    org_name = os.environ.get("SEED_ORG_NAME", "Test Org")
+    org_slug = os.environ.get("SEED_ORG_SLUG", "test-org")
+    domains = [os.environ.get("SEED_SITE_1_DOMAIN", "example.com"),
+               os.environ.get("SEED_SITE_2_DOMAIN", "second.com")]
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    st, _ = api(base, opener, "POST", "/api/auth/sign-in/email", {"email": email, "password": password})
+    if st == 200:
+        return {"org_id": None, "reused": True}
+    st, _ = api(base, opener, "POST", "/api/auth/sign-up/email",
+                {"email": email, "name": email.split("@")[0], "password": password})
+    if st >= 400:
+        raise SystemExit(f"bootstrap sign-up failed (status {st})")
+    st, _ = api(base, opener, "POST", "/api/auth/sign-in/email", {"email": email, "password": password})
+    if st != 200:
+        raise SystemExit("bootstrap sign-in failed after sign-up")
+    st, org = api(base, opener, "POST", "/api/auth/organization/create", {"name": org_name, "slug": org_slug})
+    if st >= 400:
+        raise SystemExit(f"bootstrap organization create failed (status {st})")
+    org_id = org["id"]
+    st, _ = api(base, opener, "POST", "/api/auth/organization/set-active", {"organizationId": org_id})
+    if st >= 400:
+        raise SystemExit(f"bootstrap set-active failed (status {st})")
+    for domain in domains:
+        st, _ = api(base, opener, "POST", f"/api/organizations/{org_id}/sites",
+                    {"domain": domain, "name": domain, "type": "web", "public": False,
+                     "saltUserIds": False, "blockBots": True})
+        if st >= 400:
+            raise SystemExit(f"bootstrap addSite {domain} failed (status {st})")
+    return {"org_id": org_id, "reused": False}
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://172.17.0.1:3001")
+    ap.add_argument("--base-url", default="http://localhost:8080")
     ap.add_argument("--site-id", type=int, default=1)
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--bootstrap", action="store_true",
+                    help="create first user/org/sites via signup API when missing (idempotent)")
     args = ap.parse_args()
+
+    if args.bootstrap:
+        # Relational baseline first: analytics ingestion needs the site.
+        bootstrapped = bootstrap(args.base_url)
+        print(json.dumps({"bootstrapped": bootstrapped}, indent=2))
 
     # 0. Clear previous seed analytics for determinism (idempotent reseed).
     before = ch_exec(f"SELECT count() FROM analytics.events WHERE site_id = {args.site_id}")

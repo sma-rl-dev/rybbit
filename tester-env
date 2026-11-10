@@ -18,16 +18,38 @@ COMPOSE_OVERLAY="${SCRIPT_DIR}/docker-compose.tester-env.yml"
 IMAGE_TAG="${IMAGE_TAG:-tester-env-rybbit:dev}"
 export IMAGE_TAG
 
-# Host ports. Fixed defaults match the evidence-backed prospect deployment;
-# override via env when parallel runs need distinct ports.
-# Backend :3001 (API, incl. auth + track), client :3002 (dashboard), proxy :8080.
-BACKEND_PORT="${BACKEND_PORT:-3001}"
-CLIENT_PORT="${CLIENT_PORT:-3002}"
-PROXY_PORT="${PROXY_PORT:-8080}"
-export BACKEND_PORT CLIENT_PORT PROXY_PORT
+# Public entry port. scripts/rl-env allocates it; the same-origin Caddy proxy
+# publishes it, and page + API share that origin. Backend (3001), client
+# (3002) and the databases stay on the compose network only.
+PORT="${PORT:-8080}"
+export PORT
+
+# Origin the runner browser (or a human) uses for this run. Explicit operator
+# BASE_URL / TESTER_ENV_BROWSER_ORIGIN wins; manual runs fall back to
+# localhost. It is the trusted origin and is baked into the client bundle.
+ORIGIN="${BASE_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+ORIGIN="${ORIGIN%/}"
+export BASE_URL="${ORIGIN}"
 
 SUFFIX="${RUN_ID:+-${RUN_ID}}"
 PROJECT="tester-env-rybbit${SUFFIX}"
+# Compose interpolation for per-run container names (the base file pins global
+# container_name values that would otherwise collide across runs).
+RUN_ID_SUFFIX="${SUFFIX}"
+export RUN_ID_SUFFIX
+
+# Backend trusted CORS origins for this run's page origins: the proxy serves
+# page and API on one port (see server/src/lib/cors.ts). TESTER_ENV_PUBLIC_ORIGIN
+# is appended for public-tunnel runs only, never baked into images.
+TRUSTED_ORIGINS="${ORIGIN},http://localhost:${PORT},http://127.0.0.1:${PORT}"
+if [[ -n "${TESTER_ENV_PUBLIC_ORIGIN:-}" ]]; then
+  TRUSTED_ORIGINS="${TRUSTED_ORIGINS},${TESTER_ENV_PUBLIC_ORIGIN}"
+fi
+export TRUSTED_ORIGINS
+
+# Scoped ClickHouse access for seed/verify (no ClickHouse host port published).
+# Password matches the pinned compose default (CLICKHOUSE_PASSWORD:-frog).
+export RYBBIT_CH_QUERY="docker compose -f ${COMPOSE_BASE} -f ${COMPOSE_OVERLAY} -p ${PROJECT} exec -T clickhouse clickhouse-client --user default --password frog --query"
 
 SEED_EMAIL="${SEED_EMAIL:-tester@example.com}"
 SEED_PASSWORD="${SEED_PASSWORD:-TestPass123!}"
@@ -35,6 +57,8 @@ SEED_ORG_NAME="${SEED_ORG_NAME:-Test Org}"
 SEED_ORG_SLUG="${SEED_ORG_SLUG:-test-org}"
 SEED_SITE_1_DOMAIN="${SEED_SITE_1_DOMAIN:-example.com}"
 SEED_SITE_2_DOMAIN="${SEED_SITE_2_DOMAIN:-second.com}"
+export SEED_EMAIL SEED_PASSWORD SEED_ORG_NAME SEED_ORG_SLUG
+export SEED_SITE_1_DOMAIN SEED_SITE_2_DOMAIN
 
 log() { echo "==> $*"; }
 
@@ -42,21 +66,20 @@ dc() {
   docker compose -f "${COMPOSE_BASE}" -f "${COMPOSE_OVERLAY}" -p "${PROJECT}" "$@"
 }
 
-backend_url() { echo "http://localhost:${BACKEND_PORT}"; }
-client_url() { echo "http://localhost:${CLIENT_PORT}"; }
+app_url() { echo "${ORIGIN}"; }
 
 wait_backend() {
-  log "Waiting for backend API at $(backend_url)/api/health ..."
+  log "Waiting for the app origin at $(app_url)/api/health ..."
   local i
   for i in $(seq 1 60); do
-    if curl -sf -m 5 "$(backend_url)/api/health" >/dev/null 2>&1 \
-      || curl -sf -m 5 "$(backend_url)/api/auth/get-session" >/dev/null 2>&1; then
-      log "Backend is ready."
+    if curl -sf -m 5 "$(app_url)/api/health" >/dev/null 2>&1 \
+      || curl -sf -m 5 "$(app_url)/api/auth/get-session" >/dev/null 2>&1; then
+      log "App origin is ready."
       return 0
     fi
     sleep 5
   done
-  echo "ERROR: backend did not become ready within ~300s" >&2
+  echo "ERROR: app origin did not become ready within ~300s" >&2
   return 1
 }
 
@@ -75,31 +98,29 @@ wait_services() {
 
 cmd_deploy() {
   log "Building images (${IMAGE_TAG}) and starting stack for project '${PROJECT}'"
-  log "Deploying from source: server/Dockerfile + client/Dockerfile"
+  log "Publishing the same-origin proxy on port ${PORT} (origin $(app_url))"
   dc build
   dc up -d
   wait_services || true
   wait_backend
   log "Deployment complete."
-  log "Backend API: $(backend_url)"
-  log "Client UI:   $(client_url)"
-  log "Proxy (same-origin): http://localhost:${PROXY_PORT}"
-  log "First run needs browser signup: ${SEED_EMAIL} / [SEED_PASSWORD], org '${SEED_ORG_NAME}', site '${SEED_SITE_1_DOMAIN}'."
-  log "Then run: ./tester-env seed && ./tester-env verify"
+  log "App (page + API, same origin): $(app_url)"
+  log "First run: ./tester-env seed bootstraps ${SEED_EMAIL} / [SEED_PASSWORD], org '${SEED_ORG_NAME}', site '${SEED_SITE_1_DOMAIN}' via --bootstrap when missing."
+  log "Then run: ./tester-env verify"
 }
 
 cmd_seed() {
-  log "Seeding deterministic Rybbit analytics via public /api/track ($(backend_url))"
-  log "Prerequisite: first-user signup done in browser (${SEED_EMAIL}, org '${SEED_ORG_NAME}', site '${SEED_SITE_1_DOMAIN}')"
-  BASE_URL="$(backend_url)" SITE_ID=1 python3 "${SCRIPT_DIR}/tester-env-seed/seed.py" \
-    --base-url "$(backend_url)" --site-id 1
+  log "Seeding deterministic Rybbit analytics via the same-origin proxy ($(app_url))"
+  log "Bootstrap: creates first user/org/sites via signup API when missing (idempotent)"
+  python3 "${SCRIPT_DIR}/tester-env-seed/seed.py" \
+    --base-url "$(app_url)" --site-id 1 --bootstrap
   log "Seed complete."
 }
 
 cmd_verify() {
-  log "Verifying deterministic Rybbit seed data ($(backend_url), site 1)"
-  BASE_URL="$(backend_url)" python3 "${SCRIPT_DIR}/tester-env-seed/verify.py" \
-    --base-url "$(backend_url)" --site-id 1 \
+  log "Verifying deterministic Rybbit seed data ($(app_url), site 1)"
+  python3 "${SCRIPT_DIR}/tester-env-seed/verify.py" \
+    --base-url "$(app_url)" --site-id 1 \
     --email "${SEED_EMAIL}" --password "${SEED_PASSWORD}"
   log "Verify complete."
 }
@@ -107,7 +128,7 @@ cmd_verify() {
 cmd_reset() {
   log "Removing containers and volumes for project '${PROJECT}' only (images kept)"
   dc down -v --remove-orphans 2>/dev/null || true
-  log "Clean slate. Run './tester-env deploy' to start fresh (then browser signup + seed)."
+  log "Clean slate. Run './tester-env deploy' to start fresh (then seed --bootstrap + verify)."
 }
 
 cmd_stop() {
@@ -125,10 +146,7 @@ cmd_status() {
   else
     echo "$running"
     echo ""
-    echo "URLs:"
-    echo "  Backend API: $(backend_url)"
-    echo "  Client UI:   $(client_url)"
-    echo "  Proxy:       http://localhost:${PROXY_PORT}"
+    echo "URL: $(app_url)"
     echo "Seed login: ${SEED_EMAIL} / [SEED_PASSWORD]"
   fi
 }
@@ -156,9 +174,11 @@ Commands:
 Env vars:
   IMAGE_TAG    Shared image name/tag for source builds (default tester-env-rybbit:dev; set by scripts/rl-env)
   RUN_ID       Optional run id; scopes container/volume names only (never images).
-  BACKEND_PORT Host port for the backend API (default 3001).
-  CLIENT_PORT  Host port for the dashboard client (default 3002).
-  PROXY_PORT   Host port for the same-origin Caddy proxy (default 8080).
+  PORT         Public entry port for the same-origin proxy (set by scripts/rl-env; default 8080).
+  BASE_URL     Absolute app origin baked into the client and trusted by the backend
+               (default TESTER_ENV_BROWSER_ORIGIN, else http://localhost:\$PORT).
+  TESTER_ENV_PUBLIC_ORIGIN  Runtime tunnel origin (launcher only); appended to
+               backend TRUSTED_ORIGINS, never baked into images.
 
 Credentials (deterministic): ${SEED_EMAIL} / [SEED_PASSWORD]
 Org: ${SEED_ORG_NAME} (${SEED_ORG_SLUG}); Sites: ${SEED_SITE_1_DOMAIN} (seeded), ${SEED_SITE_2_DOMAIN} (empty edge case)

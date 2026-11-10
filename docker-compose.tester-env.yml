@@ -8,63 +8,83 @@
 # Evidence-backed requirements (prospect tag v2.8.0):
 # - backend env BETTER_AUTH_SECRET (deterministic pinned value below),
 #   DISABLE_SIGNUP=false, CLUSTER_WORKERS=1, DISABLE_TELEMETRY=true,
-#   TRUSTED_ORIGINS=<browser origins> (consumed by the fork's cors.ts patch),
+#   TRUSTED_ORIGINS (computed by the tester-env CLI for this run's page
+#   origins; consumed by the fork's cors.ts patch),
 #   NODE_ENV=development (production forces Secure SameSite=None cookies that
 #   plain-http browsers reject, breaking sessions).
-# - backend/client ports published on 0.0.0.0 so containerized browsers reach
-#   the stack via the host bridge gateway (172.17.0.1).
-# - compose default network pinned to 172.16.0.0/24 (host pool exhaustion).
-# - redis host port publish removed (host 6379 conflict); backend reaches
-#   redis over the compose network (redis:6379).
-# - optional same-origin Caddy proxy on :8080 (Caddyfile.tester-env): page and
-#   API share one origin so backend origin checks pass; /api/* -> backend:3001,
-#   everything else -> client:3002.
+# - only the same-origin Caddy proxy is published, on the runner-allocated
+#   PORT; page and API share one origin so backend origin checks pass.
+#   Backend/client/databases stay on the compose network only (seed/verify
+#   reach the API through the proxy and ClickHouse via scoped `exec`).
+# - per-run container_name values: the base file pins global names
+#   (backend/client/clickhouse/postgres/redis) that would otherwise collide.
+# - no fixed network IPAM: the project-scoped default bridge lets Docker
+#   allocate a subnet, so runs never collide on a pinned /24.
 #
 # Image policy: IMAGE_TAG is exported by scripts/rl-env (content-addressed);
 # manual runs default to tester-env-rybbit:dev. RUN_ID must NOT scope image
 # names - it only scopes containers/volumes via the compose project name set
-# by the tester-env CLI (-p tester-env-rybbit[-$RUN_ID]).
+# by the tester-env CLI (-p tester-env-rybbit[-$RUN_ID]) and the per-run
+# container_name values below.
+#
+# Origin caveat: the client bundle inlines NEXT_PUBLIC_BACKEND_URL at build
+# time (upstream behavior, client/src/lib/const.ts). The CLI builds it from
+# this run's BASE_URL, so two runs with different published ports cannot share
+# one client image: rybbit stays serial (supports_parallel_runs=false) until
+# the client uses same-origin relative URLs.
 services:
+  clickhouse:
+    container_name: tester-env-rybbit${RUN_ID_SUFFIX:-}-clickhouse
+    ports: !reset []
+
+  postgres:
+    container_name: tester-env-rybbit${RUN_ID_SUFFIX:-}-postgres
+    ports: !reset []
+
   redis:
+    container_name: tester-env-rybbit${RUN_ID_SUFFIX:-}-redis
     ports: !reset []
 
   backend:
+    container_name: tester-env-rybbit${RUN_ID_SUFFIX:-}-backend
     image: ${IMAGE_TAG:-tester-env-rybbit:dev}-backend
     build:
       context: .
       dockerfile: ./server/Dockerfile
     pull_policy: build
-    ports: !override
-      - "${BACKEND_PORT:-3001}:3001"
+    ports: !reset []
     environment:
       - NODE_ENV=development
-      - TRUSTED_ORIGINS=http://172.17.0.1:3001,http://172.17.0.1:3002,http://172.17.0.1:8080
+      # Computed by the tester-env CLI so a runtime TESTER_ENV_PUBLIC_ORIGIN
+      # (launcher tunnel, never baked into images) joins the trusted set.
+      - TRUSTED_ORIGINS=${TRUSTED_ORIGINS:-http://localhost:3002,http://127.0.0.1:3002}
       - BETTER_AUTH_SECRET=tester-env-rybbit-deterministic-secret-0123456789abcdef
       - DISABLE_SIGNUP=false
       - DISABLE_TELEMETRY=true
       - CLUSTER_WORKERS=1
-      - BASE_URL=http://172.17.0.1:3001
 
   client:
+    container_name: tester-env-rybbit${RUN_ID_SUFFIX:-}-client
     image: ${IMAGE_TAG:-tester-env-rybbit:dev}-client
     build:
       context: .
       dockerfile: ./client/Dockerfile
       args:
-        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://172.17.0.1:3001}
+        NEXT_PUBLIC_BACKEND_URL: ${BASE_URL}
         NEXT_PUBLIC_DISABLE_SIGNUP: "false"
     pull_policy: build
-    ports: !override
-      - "${CLIENT_PORT:-3002}:3002"
+    ports: !reset []
     depends_on:
       - backend
 
-  # Optional same-origin proxy (see Caddyfile.tester-env): page and API share
-  # one origin so backend origin checks pass. Not part of upstream compose.
+  # Same-origin reverse proxy (see Caddyfile.tester-env): the only published
+  # port, following the runner-allocated PORT. /api/* -> backend:3001,
+  # everything else -> client:3002.
   proxy:
+    container_name: tester-env-rybbit${RUN_ID_SUFFIX:-}-proxy
     image: caddy:2.10.0
     ports:
-      - "${PROXY_PORT:-8080}:8080"
+      - "${PORT:-8080}:8080"
     volumes:
       - ./Caddyfile.tester-env:/etc/caddy/Caddyfile:ro
     depends_on:
@@ -73,7 +93,4 @@ services:
     restart: unless-stopped
 
 networks:
-  default:
-    ipam:
-      config:
-        - subnet: 172.16.0.0/24
+  default: {}

@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """Verify Rybbit seed state: ClickHouse counts + authenticated dashboard endpoints.
 
-Usage: python3 verify.py [--base-url http://172.17.0.1:3001] [--site-id 1]
+Usage: python3 verify.py [--base-url http://localhost:8080] [--site-id 1]
         [--email tester@example.com] [--password TestPass123!]
 
 Sites are private, so /has-data and /overview need a session cookie: the script
 signs in via better-auth (/api/auth/sign-in/email) first. Exit 0 when all pass.
 """
 import argparse
-import base64
 import json
+import os
+import shlex
+import subprocess
 import sys
 import urllib.request
 import urllib.error
 
 
-def ch(sql, user="default", password="frog"):
-    req = urllib.request.Request("http://127.0.0.1:8123/", data=sql.encode(), headers={
-        "Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read().decode().strip()
+def ch(sql):
+    # ClickHouse publishes no host port; run scoped queries in its container.
+    # RYBBIT_CH_QUERY is exported by the tester-env CLI (compose project run).
+    argv = shlex.split(os.environ["RYBBIT_CH_QUERY"]) + [sql]
+    out = subprocess.run(argv, capture_output=True, text=True, timeout=60, check=True)
+    return out.stdout.strip()
 
 
 def api(base, path, cookie=None):
@@ -42,7 +45,9 @@ def sign_in(base, email, password):
     req = urllib.request.Request(
         base + "/api/auth/sign-in/email",
         data=json.dumps({"email": email, "password": password}).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
+        # Our own configured origin (browser-identical): better-auth rejects
+        # origin-less auth POSTs with MISSING_OR_NULL_ORIGIN.
+        headers={"Content-Type": "application/json", "Origin": base}, method="POST")
     with urllib.request.urlopen(req, timeout=20) as r:
         cookies = []
         # urllib headers: get_all_matching_headers or .get_all()
@@ -58,7 +63,7 @@ def sign_in(base, email, password):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base-url", default="http://172.17.0.1:3001")
+    ap.add_argument("--base-url", default="http://localhost:8080")
     ap.add_argument("--email", default="tester@example.com")
     ap.add_argument("--password", default="TestPass123!")
     ap.add_argument("--site-id", type=int, default=1)

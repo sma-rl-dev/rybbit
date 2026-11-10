@@ -7,28 +7,31 @@
 
 ```bash
 ./tester-env deploy    # Build backend+client images from source, start stack, wait healthy
-# First run only: sign up in the browser (see Credentials), org "Test Org", site "example.com"
-./tester-env seed      # Populate deterministic analytics (184 pageviews / 8 sessions / 8 users)
-./tester-env verify    # Check seeded state via API
+./tester-env seed      # Bootstrap user/org/sites when missing + deterministic analytics
+./tester-env verify    # Check seeded state via the same-origin API
 ./tester-env reset     # Clean slate (containers + volumes; images kept)
 ```
+
+`PORT` selects the single published entry port (same-origin proxy); the CLI
+derives `BASE_URL` from `TESTER_ENV_BROWSER_ORIGIN` (else `http://localhost:$PORT`),
+so the dashboard, the API and the trusted CORS origin agree for every run.
 
 ## Build
 
 Builds from editable source via compose (no prebuilt images):
 
 - `server/Dockerfile` → backend API on `:3001`
-- `client/Dockerfile` → dashboard on `:3002`
-- `Caddyfile.tester-env` → optional same-origin proxy on `:8080`
-  (`/api/*` → backend, everything else → client)
+- `client/Dockerfile` → dashboard (compose network only, `:3002`)
+- `Caddyfile.tester-env` → same-origin proxy published on `$PORT`
+  (`/api/*` → backend, everything else → client); the only host port
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.tester-env.yml build
 docker compose -f docker-compose.yml -f docker-compose.tester-env.yml up -d
 ```
 
-Host ports are configurable: `BACKEND_PORT` (default 3001),
-`CLIENT_PORT` (default 3002), `PROXY_PORT` (default 8080).
+Backend, client and the databases publish no host port, so concurrent stacks
+cannot collide; seed/verify query ClickHouse through scoped `compose exec`.
 
 ## Environment (pinned in `docker-compose.tester-env.yml`)
 
@@ -36,27 +39,29 @@ Host ports are configurable: `BACKEND_PORT` (default 3001),
 - `DISABLE_SIGNUP=false` (first-user signup must stay open)
 - `CLUSTER_WORKERS=1`
 - `DISABLE_TELEMETRY=true`
-- `TRUSTED_ORIGINS=http://172.17.0.1:3001,http://172.17.0.1:3002,http://172.17.0.1:8080`
+- `TRUSTED_ORIGINS` is computed by the CLI for this run's origins
   (consumed by the fork's `server/src/lib/cors.ts` patch; upstream only
   trusts `BASE_URL` in production, which breaks split-origin deployments)
 - `NODE_ENV=development` (required: `production` forces Secure
   SameSite=None cookies that plain-http browsers reject, breaking sessions)
-- `BASE_URL=http://172.17.0.1:3001` (baked into the client as
-  `NEXT_PUBLIC_BACKEND_URL` at build time)
-- Compose default network pinned to `172.16.0.0/24` (host pool exhaustion)
-- Redis host port publish removed (host 6379 conflict); backend reaches
-  redis over the compose network (`redis:6379`)
+- `BASE_URL` = this run's browser origin (baked into the client as
+  `NEXT_PUBLIC_BACKEND_URL` at build time). Because that value is inlined per
+  build, two runs on different ports cannot share one client image: rybbit is
+  serial (`supports_parallel_runs=false`) until the client fetches a relative
+  `/api` path.
+- No fixed network IPAM: Docker allocates the project-scoped default bridge.
+- No redis/clickhouse/postgres host ports; services use the compose network
 
 ## Credentials
 
-- URL: `http://localhost:3002` (dashboard), `http://localhost:3001` (API),
-  `http://localhost:8080` (same-origin proxy)
+- URL: the proxy origin, `http://localhost:$PORT` (dashboard + API)
 - User: `tester@example.com` / `TestPass123!` (first user → admin)
 - Org: `Test Org` (slug `test-org`)
 - Sites: `example.com` (site_id 1, seeded), `second.com` (site_id 2, empty edge case)
 
-First-user signup is browser-driven (signup wizard: account → org → site);
-`seed`/`verify` assume it has been done once per fresh volume set.
+`seed --bootstrap` recreates the signup wizard state (account → org → sites)
+through the public auth API when the volume set is fresh, and reuses it when
+the credentials already exist.
 
 ## Reset
 
@@ -65,8 +70,8 @@ First-user signup is browser-driven (signup wizard: account → org → site);
 ```
 
 `docker compose down -v` removes postgres/clickhouse/redis volumes, so the
-next `deploy` re-applies migrations from scratch (healthy in ~50s). Then
-repeat the browser signup before `seed`.
+next `deploy` re-applies migrations from scratch. `seed` bootstraps the
+relational baseline again.
 
 ## Deterministic Seed
 
